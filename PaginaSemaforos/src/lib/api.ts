@@ -1,7 +1,8 @@
 // src/lib/api.ts
 
 /** Base URL tomada de .env (VITE_API_BASE_URL) o, si no existe, del origen actual del navegador */
-const rawBase = (import.meta as any)?.env?.VITE_API_BASE_URL?.toString().trim();
+const metaEnv = (import.meta as any)?.env ?? {};
+const rawBase = metaEnv?.VITE_API_BASE_URL?.toString().trim();
 
 /** Quita slashes finales para evitar // en los fetch */
 const stripTrailingSlashes = (s: string) => s.replace(/\/+$/, "");
@@ -9,11 +10,33 @@ const stripTrailingSlashes = (s: string) => s.replace(/\/+$/, "");
 const STORAGE_KEY = "esp32.apiBaseOverride";
 
 /** Normaliza base: env > window.origin > "" (SSR-safe) */
+const computeDevProxyFallback = (): string => {
+  const isDev = !!metaEnv?.DEV;
+  if (!isDev) return "";
+
+  if (typeof window === "undefined") {
+    return "http://localhost:8080";
+  }
+
+  const { hostname = "localhost", port } = window.location;
+  // Si estamos en el dev server (p.ej. 5173) asume que Servidor.py corre en el mismo host :8080
+  if (port && ["80", "443", "8080"].includes(port)) {
+    return "";
+  }
+
+  const normalizedHost = hostname && hostname.includes(":") ? `[${hostname}]` : (hostname || "localhost");
+  return `http://${normalizedHost}:8080`;
+};
+
 const fallbackBase = rawBase && rawBase.length > 0
   ? stripTrailingSlashes(rawBase)
-  : typeof window !== "undefined" && window.location?.origin
-    ? stripTrailingSlashes(window.location.origin)
-    : "";
+  : (() => {
+      const devFallback = computeDevProxyFallback();
+      if (devFallback) return stripTrailingSlashes(devFallback);
+      return typeof window !== "undefined" && window.location?.origin
+        ? stripTrailingSlashes(window.location.origin)
+        : "";
+    })();
 
 const sanitizeOverride = (value: string | null | undefined): string => {
   if (!value) return "";

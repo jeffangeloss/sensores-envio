@@ -66,7 +66,7 @@ export default function Dashboard() {
   const initialEffective = getApiBaseUrl();
   const [apiOverride, setApiOverride] = useState(initialOverride);
   const [apiEffective, setApiEffective] = useState(initialEffective);
-  const [apiField, setApiField] = useState(initialOverride);
+  const [apiField, setApiField] = useState(initialOverride || initialEffective);
   const [isSavingApiBase, setIsSavingApiBase] = useState(false);
   const [proxyBase, setProxyBase] = useState<string | null>(null);
   const proxyStatusRef = useRef<"unknown" | "available" | "unavailable">("unknown");
@@ -288,7 +288,7 @@ export default function Dashboard() {
     await performApiBaseUpdate("", true);
   }, [performApiBaseUpdate]);
 
-  useEffect(() => { setApiField(apiOverride); }, [apiOverride]);
+  useEffect(() => { setApiField(apiOverride || apiEffective); }, [apiOverride, apiEffective]);
 
   useEffect(() => { refreshProxyBase(); }, [refreshProxyBase]);
 
