@@ -1,26 +1,101 @@
 // src/lib/api.ts
 
 /** Base URL tomada de .env (VITE_API_BASE_URL) o, si no existe, del origen actual del navegador */
-const rawBase = (import.meta as any)?.env?.VITE_API_BASE_URL?.toString().trim();
+const metaEnv = (import.meta as any)?.env ?? {};
+const rawBase = metaEnv?.VITE_API_BASE_URL?.toString().trim();
 
 /** Quita slashes finales para evitar // en los fetch */
 const stripTrailingSlashes = (s: string) => s.replace(/\/+$/, "");
 
-/** Normaliza base: env > window.origin > "" (SSR-safe) */
-const normalizedBase = rawBase && rawBase.length > 0
-  ? stripTrailingSlashes(rawBase)
-  : typeof window !== "undefined" && window.location?.origin
-    ? stripTrailingSlashes(window.location.origin)
-    : "";
+const STORAGE_KEY = "esp32.apiBaseOverride";
 
-/** Exporta la base para mostrar en UI de diagnóstico */
-export const API_BASE_URL: string = normalizedBase;
+/** Normaliza base: env > window.origin > "" (SSR-safe) */
+const computeDevProxyFallback = (): string => {
+  const isDev = !!metaEnv?.DEV;
+  if (!isDev) return "";
+
+  if (typeof window === "undefined") {
+    return "http://localhost:8080";
+  }
+
+  const { hostname = "localhost", port } = window.location;
+  // Si estamos en el dev server (p.ej. 5173) asume que Servidor.py corre en el mismo host :8080
+  if (port && ["80", "443", "8080"].includes(port)) {
+    return "";
+  }
+
+  const normalizedHost = hostname && hostname.includes(":") ? `[${hostname}]` : (hostname || "localhost");
+  return `http://${normalizedHost}:8080`;
+};
+
+const fallbackBase = rawBase && rawBase.length > 0
+  ? stripTrailingSlashes(rawBase)
+  : (() => {
+      const devFallback = computeDevProxyFallback();
+      if (devFallback) return stripTrailingSlashes(devFallback);
+      return typeof window !== "undefined" && window.location?.origin
+        ? stripTrailingSlashes(window.location.origin)
+        : "";
+    })();
+
+const sanitizeOverride = (value: string | null | undefined): string => {
+  if (!value) return "";
+  let trimmed = value.trim();
+  if (!trimmed) return "";
+  if (!/^https?:\/\//i.test(trimmed)) {
+    if (/^[\w.-]+(?::\d+)?(?:\/.*)?$/.test(trimmed)) {
+      trimmed = `http://${trimmed}`;
+    }
+  }
+  return stripTrailingSlashes(trimmed);
+};
+
+let overrideBase = "";
+if (typeof window !== "undefined") {
+  try {
+    overrideBase = sanitizeOverride(window.localStorage?.getItem(STORAGE_KEY));
+  } catch (error) {
+    console.debug("No se pudo leer override de API_BASE", error);
+    overrideBase = "";
+  }
+}
+
+const effectiveBase = (): string => (overrideBase && overrideBase.length > 0) ? overrideBase : fallbackBase;
+
+export function getApiBaseOverride(): string {
+  return overrideBase;
+}
+
+export function getApiBaseUrl(): string {
+  return effectiveBase();
+}
+
+export function setApiBaseUrl(value: string): { effective: string; override: string } {
+  overrideBase = sanitizeOverride(value);
+  if (typeof window !== "undefined" && window.localStorage) {
+    try {
+      if (overrideBase && overrideBase.length > 0) {
+        window.localStorage.setItem(STORAGE_KEY, overrideBase);
+      } else {
+        window.localStorage.removeItem(STORAGE_KEY);
+      }
+    } catch (error) {
+      console.warn("No se pudo persistir override de API_BASE", error);
+    }
+  }
+  return { effective: effectiveBase(), override: overrideBase };
+}
+
+export function resetApiBaseUrl() {
+  return setApiBaseUrl("");
+}
 
 /** Une base + path (si path es absoluto http/https, lo respeta) */
 function buildUrl(path: string): string {
   if (/^https?:\/\//i.test(path)) return path;
   const p = path.startsWith("/") ? path : `/${path}`;
-  return `${API_BASE_URL}${p}`;
+  const base = getApiBaseUrl();
+  return `${base}${p}`;
 }
 
 export interface ApiRequestOptions extends RequestInit {

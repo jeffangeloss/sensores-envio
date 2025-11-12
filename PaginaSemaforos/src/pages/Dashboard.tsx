@@ -1,12 +1,14 @@
-import { useState, useEffect, useRef, useCallback } from "react";
+import { FormEvent, useState, useEffect, useRef, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "@/contexts/AuthContext";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { useToast } from "@/hooks/use-toast";
 import { Play, Square, Clock, Wifi, Database, Activity, AlertCircle, LogOut } from "lucide-react";
-import { API_BASE_URL, describeApiError, requestEsp32 } from "@/lib/api";
+import { describeApiError, requestEsp32, getApiBaseOverride, getApiBaseUrl, setApiBaseUrl } from "@/lib/api";
 
 type TrafficState = "RED" | "YELLOW" | "GREEN" | "OFF";
 
@@ -26,6 +28,19 @@ interface SensorsPayload {
   rain?: boolean;
   last_ms?: number;
 }
+
+type ProxySyncResult = { ok: true } | { ok: false; error?: unknown };
+
+const describeUnknownError = (error: unknown): string => {
+  if (error instanceof Error) {
+    return error.message || "Error desconocido";
+  }
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return "Error desconocido";
+  }
+};
 
 const trafficStateMap: Record<string, TrafficState> = {
   RED: "RED", ROJO: "RED",
@@ -47,7 +62,16 @@ export default function Dashboard() {
   const navigate = useNavigate();
   const { toast } = useToast();
 
-  const apiTarget = API_BASE_URL || (typeof window !== "undefined" ? window.location.origin : "");
+  const initialOverride = getApiBaseOverride();
+  const initialEffective = getApiBaseUrl();
+  const [apiOverride, setApiOverride] = useState(initialOverride);
+  const [apiEffective, setApiEffective] = useState(initialEffective);
+  const [apiField, setApiField] = useState(initialOverride || initialEffective);
+  const [isSavingApiBase, setIsSavingApiBase] = useState(false);
+  const [proxyBase, setProxyBase] = useState<string | null>(null);
+  const proxyStatusRef = useRef<"unknown" | "available" | "unavailable">("unknown");
+
+  const apiTarget = apiEffective || (typeof window !== "undefined" ? window.location.origin : "");
 
   const [trafficState, setTrafficState] = useState<TrafficState>("OFF");
   const [isRunning, setIsRunning] = useState(false);
@@ -65,6 +89,55 @@ export default function Dashboard() {
   const timerRef = useRef<number | null>(null);
   const isCheckingStatus = useRef(false);
   const isFetchingSensors = useRef(false);
+
+  const refreshProxyBase = useCallback(async () => {
+    if (typeof window === "undefined") return;
+    try {
+      const res = await fetch("/_config/esp32_base");
+      if (!res.ok) throw new Error(`Status ${res.status}`);
+      const payload = await res.json().catch(() => null);
+      const base = payload && typeof payload.base === "string" ? payload.base : "";
+      setProxyBase(base);
+      proxyStatusRef.current = "available";
+    } catch (error) {
+      proxyStatusRef.current = "unavailable";
+      setProxyBase(null);
+      console.debug("Proxy Servidor.py no disponible", error);
+    }
+  }, []);
+
+  const syncProxyBase = useCallback(
+    async (override: string): Promise<ProxySyncResult> => {
+      if (typeof window === "undefined") return { ok: false };
+      try {
+        const res = await fetch("/_config/esp32_base", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ base: override }),
+        });
+        if (!res.ok) {
+          const text = await res.text();
+          throw new Error(text || `Status ${res.status}`);
+        }
+        let payload: any = null;
+        try {
+          payload = await res.json();
+        } catch {
+          payload = null;
+        }
+        const base = payload && typeof payload.base === "string" ? payload.base : "";
+        setProxyBase(base);
+        proxyStatusRef.current = "available";
+        return { ok: true };
+      } catch (error) {
+        proxyStatusRef.current = "unavailable";
+        setProxyBase(null);
+        console.debug("No se pudo sincronizar proxy (Servidor.py)", error);
+        return { ok: false, error };
+      }
+    },
+    []
+  );
 
   const safeClearTimer = useCallback(() => {
     if (timerRef.current !== null) {
@@ -165,6 +238,59 @@ export default function Dashboard() {
       isFetchingSensors.current = false;
     }
   }, []);
+
+  const performApiBaseUpdate = useCallback(
+    async (value: string, reset = false) => {
+      setIsSavingApiBase(true);
+      const previousProxyStatus = proxyStatusRef.current;
+      try {
+        const { effective, override } = setApiBaseUrl(value);
+        setApiOverride(override);
+        setApiEffective(effective);
+        setApiField(override);
+        const proxyResult = await syncProxyBase(override);
+        const description = override
+          ? `Las peticiones se enviarán a ${effective}.`
+          : "Las peticiones usarán el proxy/local actual.";
+        toast({
+          title: reset ? "Destino restablecido" : "Destino actualizado",
+          description,
+        });
+        await Promise.allSettled([checkStatus(), fetchSensors()]);
+        if (!proxyResult.ok && previousProxyStatus === "available" && proxyResult.error) {
+          toast({
+            title: "Proxy no actualizado",
+            description: "No se pudo notificar a Servidor.py. Ejecuta el proxy con --esp32 <IP> o ajústalo manualmente.",
+            variant: "destructive",
+          });
+        }
+      } catch (error) {
+        console.error("Error actualizando destino API", error);
+        toast({
+          title: "Error actualizando destino",
+          description: describeUnknownError(error),
+          variant: "destructive",
+        });
+        proxyStatusRef.current = previousProxyStatus;
+      } finally {
+        setIsSavingApiBase(false);
+      }
+    },
+    [checkStatus, fetchSensors, syncProxyBase, toast]
+  );
+
+  const handleSaveApiBase = useCallback(async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    await performApiBaseUpdate(apiField);
+  }, [apiField, performApiBaseUpdate]);
+
+  const handleResetApiBase = useCallback(async () => {
+    await performApiBaseUpdate("", true);
+  }, [performApiBaseUpdate]);
+
+  useEffect(() => { setApiField(apiOverride || apiEffective); }, [apiOverride, apiEffective]);
+
+  useEffect(() => { refreshProxyBase(); }, [refreshProxyBase]);
 
   // Redirigir si no hay usuario
   useEffect(() => { if (!loading && !user) navigate("/auth"); }, [user, loading, navigate]);
@@ -287,11 +413,49 @@ export default function Dashboard() {
             <CardHeader>
               <CardTitle className="flex items-center gap-2"><Wifi className="h-5 w-5" /> Conexión</CardTitle>
             </CardHeader>
-            <CardContent>
+            <CardContent className="space-y-3">
               <Badge variant={connectionStatus === "connected" ? "default" : "secondary"}>
                 {connectionStatus === "connected" ? "Conectado" : "Desconectado"}
               </Badge>
-              <p className="mt-2 text-xs text-muted-foreground break-all">Objetivo API: {apiTarget}</p>
+              <div className="space-y-1">
+                <p className="text-xs text-muted-foreground break-all">Destino efectivo: {apiTarget}</p>
+                {proxyBase !== null && (
+                  <p className="text-xs text-muted-foreground break-all">
+                    Proxy Servidor.py: {proxyBase || "sin configurar"}
+                  </p>
+                )}
+              </div>
+              <form onSubmit={handleSaveApiBase} className="space-y-2">
+                <Label htmlFor="api-base" className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+                  URL/IP del ESP32
+                </Label>
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                  <Input
+                    id="api-base"
+                    value={apiField}
+                    onChange={event => setApiField(event.currentTarget.value)}
+                    placeholder="http://10.122.132.45"
+                    className="flex-1"
+                    autoComplete="off"
+                  />
+                  <div className="flex gap-2">
+                    <Button type="submit" disabled={isSavingApiBase}>
+                      Guardar
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={handleResetApiBase}
+                      disabled={isSavingApiBase || (!apiOverride && apiField.trim().length === 0)}
+                    >
+                      Usar proxy
+                    </Button>
+                  </div>
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  Introduce la IP entregada por el hotspot (10.122.132.X). Déjalo vacío para que Servidor.py actúe como proxy.
+                </p>
+              </form>
             </CardContent>
           </Card>
 
