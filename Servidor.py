@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 # HTTP 8080: estáticos (ZIP o carpeta) + proxy /api/* → ESP32 + Fallback SPA robusto
 import os, sys, json, urllib.request, urllib.error, mimetypes, zipfile, posixpath
+import threading
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", "8080"))
-ESP32_BASE = os.environ.get("ESP32_BASE", "http://192.168.4.1")
 STATIC_ZIP = os.environ.get("STATIC_ZIP")
 STATIC_DIR = os.environ.get("STATIC_DIR")
+DEFAULT_BASE_ENV = os.environ.get("ESP32_BASE")
 
 import argparse
 ap = argparse.ArgumentParser(description="HTTP 8080: web desde ZIP/carpeta + proxy /api/* → ESP32")
@@ -19,10 +20,44 @@ args = ap.parse_args()
 PORT = args.port
 if args.zip_path: STATIC_ZIP = args.zip_path
 if args.dir_path: STATIC_DIR = args.dir_path
-if args.esp32_base: ESP32_BASE = args.esp32_base.rstrip("/")
+"""
+Normaliza una URL base para el ESP32. Si `raw` está vacío se usa `fallback`.
+Siempre devuelve esquema http/https y sin slash final.
+"""
+def normalize_base(raw, fallback: str) -> str:
+    candidate = "" if raw is None else str(raw).strip()
+    if not candidate:
+        candidate = fallback
+    if not candidate.lower().startswith(("http://", "https://")):
+        if candidate.startswith("//"):
+            candidate = "http:" + candidate
+        else:
+            candidate = "http://" + candidate
+    return candidate.rstrip("/")
+
+DEFAULT_ESP32_BASE = normalize_base(DEFAULT_BASE_ENV, "http://192.168.4.1")
+if args.esp32_base:
+    DEFAULT_ESP32_BASE = normalize_base(args.esp32_base, DEFAULT_ESP32_BASE)
+
+ESP32_BASE = DEFAULT_ESP32_BASE
+BASE_LOCK = threading.Lock()
+
+def get_esp32_base() -> str:
+    with BASE_LOCK:
+        return ESP32_BASE
+
+def set_esp32_base(new_base) -> str:
+    global ESP32_BASE
+    normalized = normalize_base(new_base, DEFAULT_ESP32_BASE)
+    with BASE_LOCK:
+        if normalized == ESP32_BASE:
+            return ESP32_BASE
+        ESP32_BASE = normalized
+    print(f"[Proxy] ESP32_BASE -> {ESP32_BASE}")
+    return ESP32_BASE
 
 def esp32_fetch(path, method="GET", data:bytes=None, timeout=5, content_type=None):
-    url = ESP32_BASE + path
+    url = get_esp32_base() + path
     req = urllib.request.Request(url, method=method, data=data)
     if content_type: req.add_header("Content-Type", content_type)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -84,15 +119,17 @@ def serve_index(handler):
             data, ctype, code = read_from_zip(key)
             if code==200: return handler._send(200, data, ctype)
     # fallback mínimo si no hay assets
+    current_base = get_esp32_base()
     html = f"""<!doctype html><meta charset='utf-8'><title>Servidor 8080</title>
     <style>body{{font-family:system-ui;margin:24px}}</style>
     <h1>Servidor 8080</h1>
     <p>No se encontró <code>index.html</code> en DIR/ZIP.</p>
-    <pre>ESP32_BASE = {ESP32_BASE}</pre>
+    <pre>ESP32_BASE = {current_base}\nDEFAULT = {DEFAULT_ESP32_BASE}</pre>
     <ul>
       <li><a href="/api/status">/api/status</a></li>
       <li><a href="/api/sensors">/api/sensors</a></li>
       <li><a href="/api/config">/api/config</a></li>
+      <li><a href="/_config/esp32_base">/_config/esp32_base</a></li>
     </ul>"""
     return handler._send(200, html.encode("utf-8"), "text/html; charset=utf-8")
 
@@ -117,6 +154,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         # Salud
         if self.path == "/_health": return self._send(200, b'{"ok":true}')
+
+        if self.path == "/_config/esp32_base":
+            payload = {"base": get_esp32_base(), "default": DEFAULT_ESP32_BASE}
+            return self._send(200, json.dumps(payload).encode("utf-8"))
 
         # Proxy API
         if self.path.startswith("/api/"):
@@ -144,6 +185,22 @@ class Handler(BaseHTTPRequestHandler):
         return serve_index(self)
 
     def do_POST(self):
+        if self.path == "/_config/esp32_base":
+            length = int(self.headers.get("Content-Length","0") or 0)
+            raw = self.rfile.read(length) if length>0 else b"{}"
+            try:
+                payload = json.loads((raw.decode("utf-8", errors="ignore") or "{}"))
+            except json.JSONDecodeError:
+                msg = {"ok": False, "error": "JSON inválido"}
+                return self._send(400, json.dumps(msg).encode("utf-8"))
+            base_value = payload.get("base")
+            if base_value is None or isinstance(base_value, str):
+                new_base = set_esp32_base(base_value)
+                resp = {"ok": True, "base": new_base, "default": DEFAULT_ESP32_BASE}
+                return self._send(200, json.dumps(resp).encode("utf-8"))
+            msg = {"ok": False, "error": "Campo 'base' debe ser string"}
+            return self._send(400, json.dumps(msg).encode("utf-8"))
+
         if self.path in ("/api/start","/api/stop","/api/config"):
             length = int(self.headers.get("Content-Length","0") or 0)
             body = self.rfile.read(length) if length>0 else b"{}"
@@ -165,8 +222,9 @@ def run():
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"[OK] Servidor en http://{HOST}:{PORT}")
     print(f"     Modo estáticos: {mode}")
-    print(f"     ESP32_BASE: {ESP32_BASE}")
+    print(f"     ESP32_BASE actual: {get_esp32_base()} (default: {DEFAULT_ESP32_BASE})")
     print("     API: /api/status (GET), /api/sensors (GET), /api/start (POST), /api/stop (POST), /api/config (GET/POST)")
+    print("     Config: GET/POST /_config/esp32_base (actualiza destino del proxy)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
